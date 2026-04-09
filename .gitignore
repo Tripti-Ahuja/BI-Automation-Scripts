@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Output files (contain server metadata — sensitive)
+*.xlsx
+output/
+
+# Credential files (should never exist, but just in case)
+.tableau_creds.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
