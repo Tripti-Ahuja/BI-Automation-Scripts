@@ -370,6 +370,132 @@ def fetch_workspace_data(s):
     return overview_rows, access_rows
 
 
+# ===================================================================
+#  Gateway lookup for DSN mapping
+# ===================================================================
+def _build_gateway_lookup(s):
+    """Build lookup: datasource_id -> {Connection Name, Gateway Cluster}."""
+    lookup = {}
+    gw_list = get(s, ADM + "/gateways")
+    if gw_list is None:
+        gw_list = get(s, API + "/gateways") or []
+    for gw in gw_list:
+        gw_id = gw.get("id")
+        if not gw_id:
+            continue
+        gw_cluster = gw.get("name", "")
+        sources = get(s, ADM + f"/gateways/{gw_id}/datasources")
+        if sources is None:
+            sources = get(s, f"{API}/gateways/{gw_id}/datasources") or []
+        for src in sources:
+            src_id = src.get("id", "")
+            if src_id:
+                lookup[src_id] = {
+                    "Connection Name": src.get("datasourceName", ""),
+                    "Gateway Cluster": gw_cluster,
+                }
+    return lookup
+
+
+# ===================================================================
+#  OPTION 3:  WORKSPACE REPORTS & SEMANTIC MODELS (detailed)
+# ===================================================================
+def fetch_workspace_items(s):
+    """Fetch all reports and semantic models per workspace with refresh dates and DSN mapping."""
+    print("  [Building gateway connection lookup...]")
+    gw_lookup = _build_gateway_lookup(s)
+    print(f"  [Indexed {len(gw_lookup)} gateway data sources]\n")
+
+    print("  [Getting workspace list...]")
+    ws_list = get(s, ADM + "/groups?$top=5000")
+    if ws_list is None:
+        ws_list = get(s, API + "/groups") or []
+
+    if not ws_list:
+        print("  [No workspaces found]")
+        return []
+
+    total = len(ws_list)
+    print(f"  [Found {total} workspaces — fetching reports & semantic models...]")
+    print(f"  [This may take several minutes...]\n")
+
+    rows = []
+
+    for i, ws in enumerate(ws_list):
+        wid = ws.get("id", "")
+        ws_name = ws.get("name", "")
+
+        if (i + 1) % 25 == 0 or i == 0:
+            print(f"  [{i + 1}/{total}] {ws_name[:40]}", flush=True)
+
+        # --- Reports ---
+        reports = get(s, ADM + f"/groups/{wid}/reports")
+        if reports is None:
+            reports = get(s, f"{API}/groups/{wid}/reports") or []
+
+        for rpt in reports:
+            rows.append({
+                "Workspace Name": ws_name,
+                "Workspace ID": wid,
+                "Item Type": "Report",
+                "Name": rpt.get("name", ""),
+                "ID": rpt.get("id", ""),
+                "Created Date": rpt.get("createdDateTime", ""),
+                "Modified Date": rpt.get("modifiedDateTime", ""),
+                "Last Refresh Date": "",
+                "DSN Connection Name": "",
+                "Gateway Cluster": "",
+            })
+
+        # --- Datasets (Semantic Models) ---
+        datasets = get(s, ADM + f"/groups/{wid}/datasets")
+        if datasets is None:
+            datasets = get(s, f"{API}/groups/{wid}/datasets") or []
+
+        for ds in datasets:
+            did = ds.get("id", "")
+
+            last_refresh = ""
+            if ds.get("isRefreshable"):
+                refreshes = get(s, f"{API}/groups/{wid}/datasets/{did}/refreshes?$top=1")
+                if refreshes:
+                    last_refresh = refreshes[0].get("endTime",
+                                                     refreshes[0].get("startTime", ""))
+
+            dsn_names = []
+            gw_clusters = []
+            if gw_lookup:
+                ds_sources = get(s, f"{API}/groups/{wid}/datasets/{did}/datasources")
+                if ds_sources:
+                    for dss in ds_sources:
+                        gw_ds_id = dss.get("datasourceId", "")
+                        if gw_ds_id and gw_ds_id in gw_lookup:
+                            dsn_names.append(gw_lookup[gw_ds_id]["Connection Name"])
+                            gw_clusters.append(gw_lookup[gw_ds_id]["Gateway Cluster"])
+
+            rows.append({
+                "Workspace Name": ws_name,
+                "Workspace ID": wid,
+                "Item Type": "Semantic Model",
+                "Name": ds.get("name", ""),
+                "ID": did,
+                "Created Date": ds.get("createdDate", ""),
+                "Modified Date": "",
+                "Last Refresh Date": last_refresh,
+                "DSN Connection Name": ", ".join(dict.fromkeys(dsn_names)),
+                "Gateway Cluster": ", ".join(dict.fromkeys(gw_clusters)),
+            })
+
+            time.sleep(0.05)
+
+        time.sleep(0.05)
+
+    rpt_count = sum(1 for r in rows if r["Item Type"] == "Report")
+    model_count = sum(1 for r in rows if r["Item Type"] == "Semantic Model")
+    print(f"\n  Done — {rpt_count} reports, {model_count} semantic models\n")
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Excel export
 # ---------------------------------------------------------------------------
@@ -434,10 +560,11 @@ def main():
         print("  " + "-" * 35)
         print("  1. Gateway Connections (DSN)")
         print("  2. Workspace Details")
-        print("  3. Export ALL (both in one file)")
+        print("  3. Reports & Semantic Models (detailed)")
+        print("  4. Export ALL (everything in one file)")
         print("  0. Exit")
 
-        ch = input("\n  Pick (0-3): ").strip()
+        ch = input("\n  Pick (0-4): ").strip()
 
         if ch == "0":
             print("\n  Bye!\n")
@@ -464,25 +591,40 @@ def main():
             input("\n  Press Enter to go back...")
 
         elif ch == "3":
+            print("\n  Fetching Reports & Semantic Models...\n")
+            ws_items = fetch_workspace_items(session)
+            sheets = {"Reports & Semantic Models": ws_items}
+            path = _save_multi(sheets, "Reports_SemanticModels")
+            print(f"  Saved -> {path}")
+            rpt_n = sum(1 for r in ws_items if r.get("Item Type") == "Report")
+            sm_n = sum(1 for r in ws_items if r.get("Item Type") == "Semantic Model")
+            print(f"  Reports: {rpt_n}  |  Semantic Models: {sm_n}")
+            input("\n  Press Enter to go back...")
+
+        elif ch == "4":
             print("\n  Fetching everything...\n")
             print("  --- Gateway Connections ---\n")
             conns, conn_users = fetch_gateway_data(session)
             print("  --- Workspace Details ---\n")
             overview, ws_access = fetch_workspace_data(session)
+            print("  --- Reports & Semantic Models ---\n")
+            ws_items = fetch_workspace_items(session)
 
             sheets = {
                 "Connections": conns,
                 "Connection Users": conn_users,
                 "Workspace Overview": overview,
                 "Workspace Access": ws_access,
+                "Reports & Semantic Models": ws_items,
             }
             path = _save_multi(sheets, "ALL")
             total = sum(len(v) for v in sheets.values())
             print(f"  Exported {total} total rows -> {path}")
-            print(f"    Connections:        {len(conns)}")
-            print(f"    Connection Users:   {len(conn_users)}")
-            print(f"    Workspace Overview: {len(overview)}")
-            print(f"    Workspace Access:   {len(ws_access)}")
+            print(f"    Connections:              {len(conns)}")
+            print(f"    Connection Users:         {len(conn_users)}")
+            print(f"    Workspace Overview:       {len(overview)}")
+            print(f"    Workspace Access:         {len(ws_access)}")
+            print(f"    Reports & Semantic Models: {len(ws_items)}")
             print("\n  NOTE: file contains sensitive data (server names, emails, etc.)")
             input("\n  Press Enter to go back...")
 

@@ -1,2 +1,4 @@
 tableauserverclient>=0.31
 openpyxl
+msal
+requests
