@@ -4,8 +4,9 @@ Focus: Gateway Connections (DSN) & Workspace Details
 Prerequisites: pip install msal requests openpyxl
      (VDI fix): pip install truststore
 """
-import sys, os, re, time, json
+import sys, os, re, time, json, threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import msal, requests
@@ -43,10 +44,11 @@ CID = "ea0616ba-638b-4df5-95b9-636659ae5121"
 SCOPES = ["https://analysis.windows.net/powerbi/api/.default"]
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+PARALLEL_WORKERS = 8
 
 
 # ---------------------------------------------------------------------------
-# Session — MSAL auth + automatic silent token refresh
+# Session — MSAL auth + automatic silent token refresh (thread-safe)
 # ---------------------------------------------------------------------------
 class Session:
 
@@ -55,16 +57,18 @@ class Session:
         self._account = account
         self._token = token
         self._expiry = time.time() + expires_in
+        self._lock = threading.Lock()
 
     def token(self):
-        if time.time() < self._expiry - 300:
+        with self._lock:
+            if time.time() < self._expiry - 300:
+                return self._token
+            result = self._app.acquire_token_silent(SCOPES, account=self._account)
+            if result and "access_token" in result:
+                self._token = result["access_token"]
+                self._expiry = time.time() + result.get("expires_in", 3600)
+                print("  [Token refreshed]")
             return self._token
-        result = self._app.acquire_token_silent(SCOPES, account=self._account)
-        if result and "access_token" in result:
-            self._token = result["access_token"]
-            self._expiry = time.time() + result.get("expires_in", 3600)
-            print("  [Token refreshed]")
-        return self._token
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +138,51 @@ def get(session, url):
     return items
 
 
+def _get_json(session, url):
+    """Single GET (no pagination). Returns parsed JSON dict or None."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            h = {"Authorization": "Bearer " + session.token()}
+            r = requests.get(url, headers=h, timeout=120, verify=_SSL_VERIFY)
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                continue
+            return None
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", RETRY_DELAY * (attempt + 1)))
+            time.sleep(wait)
+            continue
+        if r.status_code == 401:
+            continue
+        return None
+    return None
+
+
+def _post_json(session, url, body):
+    """POST with JSON body. Returns parsed response or None."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            h = {"Authorization": "Bearer " + session.token(),
+                 "Content-Type": "application/json"}
+            r = requests.post(url, headers=h, json=body, timeout=60, verify=_SSL_VERIFY)
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                continue
+            return None
+        if r.status_code in (200, 202):
+            return r.json()
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", RETRY_DELAY * (attempt + 1)))
+            time.sleep(wait)
+            continue
+        return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -176,8 +225,18 @@ _ACCESS_LABELS = {
     "Read": "User",
     "ReadOverrideEffectiveIdentity": "User with resharing",
     "Owner": "Owner",
+    "ReadWrite": "Owner",
     "Write": "Owner",
     "None": "None",
+}
+
+_ROLE_PRIORITY = {
+    "Owner": 5,
+    "ReadWrite": 4,
+    "Write": 3,
+    "ReadOverrideEffectiveIdentity": 2,
+    "Read": 1,
+    "None": 0,
 }
 
 _ACCESS_FIELD_NAMES = [
@@ -191,20 +250,24 @@ _ACCESS_FIELD_NAMES = [
 
 
 def _best_access_right(user_dict):
+    """Return the highest-privilege access right found across all relevant API fields."""
+    best_val = ""
+    best_pri = -1
     for field in _ACCESS_FIELD_NAMES:
         val = user_dict.get(field)
         if val and str(val) != "None":
-            return str(val)
-    return user_dict.get("datasourceAccessRight", "")
+            pri = _ROLE_PRIORITY.get(str(val), 0)
+            if pri > best_pri:
+                best_pri = pri
+                best_val = str(val)
+    return best_val or user_dict.get("datasourceAccessRight", "")
 
 
 def _get_ws_users(s, wid):
     """Try multiple API paths to get workspace users."""
-    # Path 1: admin per-workspace with $top
     users = get(s, ADM + f"/groups/{wid}/users?$top=500")
     if users:
         return users
-    # Path 2: standard API (works if admin has implicit workspace access)
     users = get(s, f"{API}/groups/{wid}/users")
     if users:
         return users
@@ -223,7 +286,7 @@ def _get_ws_item_count(s, wid, item_type):
 
 
 # ===================================================================
-#  OPTION 1:  GATEWAY CONNECTIONS (DSN)
+#  OPTION 1:  GATEWAY CONNECTIONS (DSN) — parallelized user fetch
 # ===================================================================
 def fetch_gateway_data(s):
     print("  [Getting gateways...]")
@@ -237,75 +300,98 @@ def fetch_gateway_data(s):
 
     print(f"  [Found {len(gw_list)} gateway cluster(s)]\n")
 
-    conn_rows = []
-    user_rows = []
-
+    all_sources = []
     for gw in gw_list:
         gw_id = gw.get("id")
         if not gw_id:
             continue
         gw_cluster = gw.get("name", "")
-
         sources = get(s, ADM + f"/gateways/{gw_id}/datasources")
         if sources is None:
             sources = get(s, f"{API}/gateways/{gw_id}/datasources") or []
         print(f"  Gateway: {gw_cluster} — {len(sources)} connections")
-
         for src in sources:
-            src_id = src.get("id", "")
-            src_name = src.get("datasourceName", "")
-            raw_type = src.get("datasourceType", "")
-            cd = _parse_conn(src.get("connectionDetails", ""))
-            conn_type = _resolve_type(raw_type, cd)
-            server = _resolve_server(cd, raw_type)
+            all_sources.append((gw_id, gw_cluster, src))
 
-            # Try admin endpoint first, fall back to standard
-            users = get(s, ADM + f"/gateways/{gw_id}/datasources/{src_id}/users")
-            if users is None:
-                users = get(s, f"{API}/gateways/{gw_id}/datasources/{src_id}/users")
-            if users is None:
-                users = []
+    if not all_sources:
+        return [], []
 
-            user_summary = ", ".join(
-                u.get("displayName") or u.get("emailAddress", "")
-                for u in users
-            )
+    print(f"\n  [Fetching users for {len(all_sources)} datasources ({PARALLEL_WORKERS} threads)]")
 
-            conn_rows.append({
+    conn_rows = []
+    user_rows = []
+    lock = threading.Lock()
+    counter = [0]
+
+    def _process_source(args):
+        gw_id, gw_cluster, src = args
+        src_id = src.get("id", "")
+        src_name = src.get("datasourceName", "")
+        raw_type = src.get("datasourceType", "")
+        cd = _parse_conn(src.get("connectionDetails", ""))
+        conn_type = _resolve_type(raw_type, cd)
+        server = _resolve_server(cd, raw_type)
+
+        users = get(s, ADM + f"/gateways/{gw_id}/datasources/{src_id}/users")
+        if users is None:
+            users = get(s, f"{API}/gateways/{gw_id}/datasources/{src_id}/users")
+        if users is None:
+            users = []
+
+        user_summary = ", ".join(
+            u.get("displayName") or u.get("emailAddress", "")
+            for u in users
+        )
+
+        c_row = {
+            "Connection Name": src_name,
+            "Connection Type": conn_type,
+            "Server": server,
+            "Database": cd.get("database", ""),
+            "URL": cd.get("url", ""),
+            "Path": cd.get("path", cd.get("extensionDataSourcePath", "")),
+            "Users": user_summary,
+            "# Users": len(users),
+            "Gateway Cluster": gw_cluster,
+            "Credential Type": src.get("credentialType", ""),
+        }
+
+        u_rows = []
+        for u in users:
+            raw_right = _best_access_right(u)
+            u_rows.append({
                 "Connection Name": src_name,
                 "Connection Type": conn_type,
-                "Server": server,
-                "Database": cd.get("database", ""),
-                "URL": cd.get("url", ""),
-                "Path": cd.get("path", cd.get("extensionDataSourcePath", "")),
-                "Users": user_summary,
-                "# Users": len(users),
                 "Gateway Cluster": gw_cluster,
-                "Credential Type": src.get("credentialType", ""),
+                "User Name": u.get("displayName", ""),
+                "Email": u.get("emailAddress", ""),
+                "Access Role": _ACCESS_LABELS.get(raw_right, raw_right),
+                "Access (Raw API)": raw_right,
+                "Principal Type": u.get("principalType", ""),
+                "All API Fields": json.dumps(u, default=str),
             })
 
-            for u in users:
-                raw_right = _best_access_right(u)
-                user_rows.append({
-                    "Connection Name": src_name,
-                    "Connection Type": conn_type,
-                    "Gateway Cluster": gw_cluster,
-                    "User Name": u.get("displayName", ""),
-                    "Email": u.get("emailAddress", ""),
-                    "Access Role": _ACCESS_LABELS.get(raw_right, raw_right),
-                    "Access (Raw API)": raw_right,
-                    "Principal Type": u.get("principalType", ""),
-                    "All API Fields": json.dumps(u, default=str),
-                })
+        with lock:
+            conn_rows.append(c_row)
+            user_rows.extend(u_rows)
+            counter[0] += 1
+            if counter[0] % 25 == 0 or counter[0] == len(all_sources):
+                print(f"  [{counter[0]}/{len(all_sources)}] datasources processed", flush=True)
 
-            time.sleep(0.1)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        futs = [pool.submit(_process_source, a) for a in all_sources]
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as e:
+                print(f"  [Worker error: {e}]")
 
     print(f"\n  Done — {len(conn_rows)} connections, {len(user_rows)} user entries\n")
     return conn_rows, user_rows
 
 
 # ===================================================================
-#  OPTION 2:  WORKSPACE DETAILS
+#  OPTION 2:  WORKSPACE DETAILS — parallelized
 # ===================================================================
 def fetch_workspace_data(s):
     print("  [Getting workspace list...]")
@@ -318,53 +404,66 @@ def fetch_workspace_data(s):
         return [], []
 
     total = len(ws_list)
-    print(f"  [Found {total} workspaces — fetching users, reports, datasets per workspace]")
+    print(f"  [Found {total} workspaces — fetching details ({PARALLEL_WORKERS} threads)]")
     print(f"  [This will take a few minutes...]\n")
 
     overview_rows = []
     access_rows = []
+    lock = threading.Lock()
+    counter = [0]
 
-    for i, ws in enumerate(ws_list):
-        wid = ws.get("id", "")
-        ws_name = ws.get("name", "")
+    def _process_workspace(ws):
+        try:
+            wid = ws.get("id", "")
+            ws_name = ws.get("name", "")
 
-        if (i + 1) % 25 == 0 or i == 0:
-            print(f"  [{i + 1}/{total}] {ws_name[:40]}", flush=True)
+            users = _get_ws_users(s, wid)
+            rpt_count = _get_ws_item_count(s, wid, "reports")
+            ds_count = _get_ws_item_count(s, wid, "datasets")
 
-        users = _get_ws_users(s, wid)
-        rpt_count = _get_ws_item_count(s, wid, "reports")
-        ds_count = _get_ws_item_count(s, wid, "datasets")
+            owners = [
+                u.get("displayName") or u.get("emailAddress", "")
+                for u in users
+                if u.get("groupUserAccessRight") == "Admin"
+            ]
 
-        owners = [
-            u.get("displayName") or u.get("emailAddress", "")
-            for u in users
-            if u.get("groupUserAccessRight") == "Admin"
-        ]
-
-        overview_rows.append({
-            "Workspace Name": ws_name,
-            "Workspace ID": wid,
-            "Type": ws.get("type", ""),
-            "State": ws.get("state", ""),
-            "Owner(s)": ", ".join(owners),
-            "# Reports": rpt_count,
-            "# Semantic Models": ds_count,
-            "# Users/Groups with Access": len(users),
-            "Capacity ID": ws.get("capacityId", ""),
-        })
-
-        for u in users:
-            access_rows.append({
-                "Workspace": ws_name,
+            o_row = {
+                "Workspace Name": ws_name,
                 "Workspace ID": wid,
-                "User / Group Name": u.get("displayName", ""),
-                "Email": u.get("emailAddress", ""),
-                "Role": u.get("groupUserAccessRight", ""),
-                "Principal Type": u.get("principalType", ""),
-                "Identifier (UPN)": u.get("identifier", ""),
-            })
+                "Type": ws.get("type", ""),
+                "State": ws.get("state", ""),
+                "Owner(s)": ", ".join(owners),
+                "# Reports": rpt_count,
+                "# Semantic Models": ds_count,
+                "# Users/Groups with Access": len(users),
+                "Capacity ID": ws.get("capacityId", ""),
+            }
 
-        time.sleep(0.15)
+            a_rows = []
+            for u in users:
+                a_rows.append({
+                    "Workspace": ws_name,
+                    "Workspace ID": wid,
+                    "User / Group Name": u.get("displayName", ""),
+                    "Email": u.get("emailAddress", ""),
+                    "Role": u.get("groupUserAccessRight", ""),
+                    "Principal Type": u.get("principalType", ""),
+                    "Identifier (UPN)": u.get("identifier", ""),
+                })
+
+            with lock:
+                overview_rows.append(o_row)
+                access_rows.extend(a_rows)
+                counter[0] += 1
+                if counter[0] % 50 == 0 or counter[0] == total:
+                    print(f"  [{counter[0]}/{total}] workspaces", flush=True)
+        except Exception as e:
+            with lock:
+                counter[0] += 1
+            print(f"  [Error: {ws.get('name', '?')}: {e}]")
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        list(pool.map(_process_workspace, ws_list))
 
     print(f"\n  Done — {len(overview_rows)} workspaces, {len(access_rows)} access entries\n")
     return overview_rows, access_rows
@@ -398,7 +497,62 @@ def _build_gateway_lookup(s):
 
 
 # ===================================================================
-#  OPTION 3:  WORKSPACE REPORTS & SEMANTIC MODELS (detailed)
+#  Admin Scan API — batch workspace metadata in groups of 100
+# ===================================================================
+def _scan_workspaces(s, workspace_ids):
+    """Use admin scan API to get detailed workspace info with report dates and datasource details.
+    Returns (workspaces_list, datasource_instances_list) or ([], []) on failure."""
+    all_workspaces = []
+    all_ds_instances = []
+    total_batches = (len(workspace_ids) + 99) // 100
+
+    for batch_start in range(0, len(workspace_ids), 100):
+        batch = workspace_ids[batch_start:batch_start + 100]
+        batch_num = batch_start // 100 + 1
+        print(f"  [Scan batch {batch_num}/{total_batches} — {len(batch)} workspaces]", flush=True)
+
+        result = _post_json(
+            s,
+            f"{ADM}/workspaces/getInfo?datasourceDetails=true&datasetSchema=false"
+            "&datasetExpressions=false&lineage=false&users=false",
+            {"workspaces": batch},
+        )
+        if not result or "id" not in result:
+            print(f"  [Scan batch {batch_num} failed to start — skipping]")
+            continue
+        scan_id = result["id"]
+
+        status = ""
+        for _ in range(120):
+            time.sleep(2)
+            status_resp = _get_json(s, f"{ADM}/workspaces/scanStatus/{scan_id}")
+            if not status_resp:
+                continue
+            status = status_resp.get("status", "")
+            if status == "Succeeded":
+                break
+            if status not in ("NotStarted", "Running"):
+                print(f"  [Scan batch {batch_num} ended with status: {status}]")
+                break
+        else:
+            print(f"  [Scan batch {batch_num} timed out]")
+            continue
+
+        if status != "Succeeded":
+            continue
+
+        scan_result = _get_json(s, f"{ADM}/workspaces/scanResult/{scan_id}")
+        if scan_result:
+            all_workspaces.extend(scan_result.get("workspaces", []))
+            all_ds_instances.extend(scan_result.get("datasourceInstances", []))
+
+    return all_workspaces, all_ds_instances
+
+
+# ===================================================================
+#  OPTION 3:  WORKSPACE REPORTS & SEMANTIC MODELS
+#             Primary: admin scan API (batch, includes report dates)
+#             Fallback: per-workspace iteration with parallel threads
 # ===================================================================
 def fetch_workspace_items(s):
     """Fetch all reports and semantic models per workspace with refresh dates and DSN mapping."""
@@ -410,30 +564,30 @@ def fetch_workspace_items(s):
     ws_list = get(s, ADM + "/groups?$top=5000")
     if ws_list is None:
         ws_list = get(s, API + "/groups") or []
-
     if not ws_list:
         print("  [No workspaces found]")
         return []
 
-    total = len(ws_list)
-    print(f"  [Found {total} workspaces — fetching reports & semantic models...]")
-    print(f"  [This may take several minutes...]\n")
+    ws_ids = [ws["id"] for ws in ws_list if ws.get("id")]
+    total = len(ws_ids)
+    print(f"  [Found {total} workspaces — using admin scan API]\n")
+
+    scanned_ws, ds_instances = _scan_workspaces(s, ws_ids)
+
+    if not scanned_ws:
+        print("  [Scan API unavailable — falling back to per-workspace fetching]\n")
+        return _fetch_workspace_items_fallback(s, ws_list, gw_lookup)
+
+    print(f"\n  [Scan complete — processing {len(scanned_ws)} workspaces]")
 
     rows = []
+    refreshable = []
 
-    for i, ws in enumerate(ws_list):
-        wid = ws.get("id", "")
+    for ws in scanned_ws:
         ws_name = ws.get("name", "")
+        wid = ws.get("id", "")
 
-        if (i + 1) % 25 == 0 or i == 0:
-            print(f"  [{i + 1}/{total}] {ws_name[:40]}", flush=True)
-
-        # --- Reports ---
-        reports = get(s, ADM + f"/groups/{wid}/reports")
-        if reports is None:
-            reports = get(s, f"{API}/groups/{wid}/reports") or []
-
-        for rpt in reports:
+        for rpt in ws.get("reports", []):
             rows.append({
                 "Workspace Name": ws_name,
                 "Workspace ID": wid,
@@ -441,38 +595,24 @@ def fetch_workspace_items(s):
                 "Name": rpt.get("name", ""),
                 "ID": rpt.get("id", ""),
                 "Created Date": rpt.get("createdDateTime", ""),
-                "Modified Date": rpt.get("modifiedDateTime", ""),
+                "Modified Date": rpt.get("modifiedDateTime", rpt.get("modifiedDate", "")),
                 "Last Refresh Date": "",
                 "DSN Connection Name": "",
                 "Gateway Cluster": "",
             })
 
-        # --- Datasets (Semantic Models) ---
-        datasets = get(s, ADM + f"/groups/{wid}/datasets")
-        if datasets is None:
-            datasets = get(s, f"{API}/groups/{wid}/datasets") or []
-
-        for ds in datasets:
+        for ds in ws.get("datasets", []):
             did = ds.get("id", "")
 
-            last_refresh = ""
-            if ds.get("isRefreshable"):
-                refreshes = get(s, f"{API}/groups/{wid}/datasets/{did}/refreshes?$top=1")
-                if refreshes:
-                    last_refresh = refreshes[0].get("endTime",
-                                                     refreshes[0].get("startTime", ""))
-
             dsn_names = []
-            gw_clusters = []
-            if gw_lookup:
-                ds_sources = get(s, f"{API}/groups/{wid}/datasets/{did}/datasources")
-                if ds_sources:
-                    for dss in ds_sources:
-                        gw_ds_id = dss.get("datasourceId", "")
-                        if gw_ds_id and gw_ds_id in gw_lookup:
-                            dsn_names.append(gw_lookup[gw_ds_id]["Connection Name"])
-                            gw_clusters.append(gw_lookup[gw_ds_id]["Gateway Cluster"])
+            gw_clusters_list = []
+            for usage in ds.get("datasourceUsages", []):
+                dsi_id = usage.get("datasourceInstanceId", "")
+                if dsi_id and dsi_id in gw_lookup:
+                    dsn_names.append(gw_lookup[dsi_id]["Connection Name"])
+                    gw_clusters_list.append(gw_lookup[dsi_id]["Gateway Cluster"])
 
+            row_idx = len(rows)
             rows.append({
                 "Workspace Name": ws_name,
                 "Workspace ID": wid,
@@ -481,14 +621,128 @@ def fetch_workspace_items(s):
                 "ID": did,
                 "Created Date": ds.get("createdDate", ""),
                 "Modified Date": "",
-                "Last Refresh Date": last_refresh,
+                "Last Refresh Date": "",
                 "DSN Connection Name": ", ".join(dict.fromkeys(dsn_names)),
-                "Gateway Cluster": ", ".join(dict.fromkeys(gw_clusters)),
+                "Gateway Cluster": ", ".join(dict.fromkeys(gw_clusters_list)),
             })
 
-            time.sleep(0.05)
+            if ds.get("isRefreshable"):
+                refreshable.append((wid, did, row_idx))
 
-        time.sleep(0.05)
+    # Fetch refresh dates in parallel
+    if refreshable:
+        print(f"  [Fetching last refresh for {len(refreshable)} semantic models ({PARALLEL_WORKERS} threads)]")
+        lock = threading.Lock()
+        counter = [0]
+
+        def _fetch_refresh(args):
+            wid, did, idx = args
+            try:
+                refreshes = get(s, f"{API}/groups/{wid}/datasets/{did}/refreshes?$top=1")
+                date = ""
+                if refreshes:
+                    date = refreshes[0].get("endTime", refreshes[0].get("startTime", ""))
+                with lock:
+                    rows[idx]["Last Refresh Date"] = date
+                    counter[0] += 1
+                    if counter[0] % 100 == 0:
+                        print(f"  [{counter[0]}/{len(refreshable)}] refreshes", flush=True)
+            except Exception:
+                with lock:
+                    counter[0] += 1
+
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+            list(pool.map(_fetch_refresh, refreshable))
+        print(f"  [{len(refreshable)}/{len(refreshable)}] refreshes done")
+
+    rpt_count = sum(1 for r in rows if r["Item Type"] == "Report")
+    model_count = sum(1 for r in rows if r["Item Type"] == "Semantic Model")
+    print(f"\n  Done — {rpt_count} reports, {model_count} semantic models\n")
+    return rows
+
+
+def _fetch_workspace_items_fallback(s, ws_list, gw_lookup):
+    """Fallback: per-workspace parallel iteration when scan API is unavailable."""
+    total = len(ws_list)
+    print(f"  [Processing {total} workspaces ({PARALLEL_WORKERS} threads)]\n")
+
+    rows = []
+    lock = threading.Lock()
+    counter = [0]
+
+    def _process_workspace(ws):
+        try:
+            wid = ws.get("id", "")
+            ws_name = ws.get("name", "")
+            local_rows = []
+
+            reports = get(s, ADM + f"/groups/{wid}/reports")
+            if reports is None:
+                reports = get(s, f"{API}/groups/{wid}/reports") or []
+
+            for rpt in reports:
+                local_rows.append({
+                    "Workspace Name": ws_name,
+                    "Workspace ID": wid,
+                    "Item Type": "Report",
+                    "Name": rpt.get("name", ""),
+                    "ID": rpt.get("id", ""),
+                    "Created Date": rpt.get("createdDateTime", ""),
+                    "Modified Date": rpt.get("modifiedDateTime", rpt.get("modifiedDate", "")),
+                    "Last Refresh Date": "",
+                    "DSN Connection Name": "",
+                    "Gateway Cluster": "",
+                })
+
+            datasets = get(s, ADM + f"/groups/{wid}/datasets")
+            if datasets is None:
+                datasets = get(s, f"{API}/groups/{wid}/datasets") or []
+
+            for ds in datasets:
+                did = ds.get("id", "")
+                last_refresh = ""
+                if ds.get("isRefreshable"):
+                    refreshes = get(s, f"{API}/groups/{wid}/datasets/{did}/refreshes?$top=1")
+                    if refreshes:
+                        last_refresh = refreshes[0].get("endTime",
+                                                         refreshes[0].get("startTime", ""))
+
+                dsn_names = []
+                gw_clusters_list = []
+                if gw_lookup:
+                    ds_sources = get(s, f"{API}/groups/{wid}/datasets/{did}/datasources")
+                    if ds_sources:
+                        for dss in ds_sources:
+                            gw_ds_id = dss.get("datasourceId", "")
+                            if gw_ds_id and gw_ds_id in gw_lookup:
+                                dsn_names.append(gw_lookup[gw_ds_id]["Connection Name"])
+                                gw_clusters_list.append(gw_lookup[gw_ds_id]["Gateway Cluster"])
+
+                local_rows.append({
+                    "Workspace Name": ws_name,
+                    "Workspace ID": wid,
+                    "Item Type": "Semantic Model",
+                    "Name": ds.get("name", ""),
+                    "ID": did,
+                    "Created Date": ds.get("createdDate", ""),
+                    "Modified Date": "",
+                    "Last Refresh Date": last_refresh,
+                    "DSN Connection Name": ", ".join(dict.fromkeys(dsn_names)),
+                    "Gateway Cluster": ", ".join(dict.fromkeys(gw_clusters_list)),
+                })
+
+            with lock:
+                rows.extend(local_rows)
+                counter[0] += 1
+                if counter[0] % 50 == 0 or counter[0] == total:
+                    print(f"  [{counter[0]}/{total}] workspaces", flush=True)
+        except Exception as e:
+            with lock:
+                counter[0] += 1
+            print(f"  [Error: {ws.get('name', '?')}: {e}]")
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        list(pool.map(_process_workspace, ws_list))
 
     rpt_count = sum(1 for r in rows if r["Item Type"] == "Report")
     model_count = sum(1 for r in rows if r["Item Type"] == "Semantic Model")
