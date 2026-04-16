@@ -40,7 +40,7 @@ if not _SSL_VERIFY:
 
 API = "https://api.powerbi.com/v1.0/myorg"
 ADM = API + "/admin"
-CID = "ea0616ba-638b-4df5-95b9-636659ae5121"
+CID = "ea0616ba-638b-4df5-95b9-636659ae5121"   # Microsoft Power BI PowerShell public client
 SCOPES = ["https://analysis.windows.net/powerbi/api/.default"]
 MAX_RETRIES = 3
 RETRY_DELAY = 5
@@ -138,51 +138,6 @@ def get(session, url):
     return items
 
 
-def _get_json(session, url):
-    """Single GET (no pagination). Returns parsed JSON dict or None."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            h = {"Authorization": "Bearer " + session.token()}
-            r = requests.get(url, headers=h, timeout=120, verify=_SSL_VERIFY)
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-                continue
-            return None
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", RETRY_DELAY * (attempt + 1)))
-            time.sleep(wait)
-            continue
-        if r.status_code == 401:
-            continue
-        return None
-    return None
-
-
-def _post_json(session, url, body):
-    """POST with JSON body. Returns parsed response or None."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            h = {"Authorization": "Bearer " + session.token(),
-                 "Content-Type": "application/json"}
-            r = requests.post(url, headers=h, json=body, timeout=60, verify=_SSL_VERIFY)
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-                continue
-            return None
-        if r.status_code in (200, 202):
-            return r.json()
-        if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", RETRY_DELAY * (attempt + 1)))
-            time.sleep(wait)
-            continue
-        return None
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -230,41 +185,19 @@ _ACCESS_LABELS = {
     "None": "None",
 }
 
-_ROLE_PRIORITY = {
-    "Owner": 5,
-    "ReadWrite": 4,
-    "Write": 3,
-    "ReadOverrideEffectiveIdentity": 2,
-    "Read": 1,
-    "None": 0,
-}
 
-_ACCESS_FIELD_NAMES = [
-    "datasourceAccessRight",
-    "datasourceUserAccessRight",
-    "accessRight",
-    "role",
-    "permissions",
-    "gatewayDatasourceUserAccessRight",
-]
-
-
-def _best_access_right(user_dict):
-    """Return the highest-privilege access right found across all relevant API fields."""
-    best_val = ""
-    best_pri = -1
-    for field in _ACCESS_FIELD_NAMES:
-        val = user_dict.get(field)
-        if val and str(val) != "None":
-            pri = _ROLE_PRIORITY.get(str(val), 0)
-            if pri > best_pri:
-                best_pri = pri
-                best_val = str(val)
-    return best_val or user_dict.get("datasourceAccessRight", "")
+def _get_items(s, wid, item_type):
+    """Fetch items (reports/datasets) from a workspace, trying admin then standard API."""
+    items = get(s, ADM + f"/groups/{wid}/{item_type}")
+    if items is not None:
+        return items
+    items = get(s, f"{API}/groups/{wid}/{item_type}")
+    if items is not None:
+        return items
+    return []
 
 
 def _get_ws_users(s, wid):
-    """Try multiple API paths to get workspace users."""
     users = get(s, ADM + f"/groups/{wid}/users?$top=500")
     if users:
         return users
@@ -274,19 +207,8 @@ def _get_ws_users(s, wid):
     return []
 
 
-def _get_ws_item_count(s, wid, item_type):
-    """Try multiple API paths to count reports/datasets in a workspace."""
-    items = get(s, ADM + f"/groups/{wid}/{item_type}")
-    if items is not None:
-        return len(items)
-    items = get(s, f"{API}/groups/{wid}/{item_type}")
-    if items is not None:
-        return len(items)
-    return 0
-
-
 # ===================================================================
-#  OPTION 1:  GATEWAY CONNECTIONS (DSN) — parallelized user fetch
+#  OPTION 1:  GATEWAY CONNECTIONS (DSN)
 # ===================================================================
 def fetch_gateway_data(s):
     print("  [Getting gateways...]")
@@ -358,17 +280,16 @@ def fetch_gateway_data(s):
 
         u_rows = []
         for u in users:
-            raw_right = _best_access_right(u)
+            raw = u.get("datasourceAccessRight", "")
             u_rows.append({
                 "Connection Name": src_name,
                 "Connection Type": conn_type,
                 "Gateway Cluster": gw_cluster,
                 "User Name": u.get("displayName", ""),
                 "Email": u.get("emailAddress", ""),
-                "Access Role": _ACCESS_LABELS.get(raw_right, raw_right),
-                "Access (Raw API)": raw_right,
+                "Access (API)": _ACCESS_LABELS.get(raw, raw),
+                "Actual Role": "Check Power BI UI",
                 "Principal Type": u.get("principalType", ""),
-                "All API Fields": json.dumps(u, default=str),
             })
 
         with lock:
@@ -376,7 +297,7 @@ def fetch_gateway_data(s):
             user_rows.extend(u_rows)
             counter[0] += 1
             if counter[0] % 25 == 0 or counter[0] == len(all_sources):
-                print(f"  [{counter[0]}/{len(all_sources)}] datasources processed", flush=True)
+                print(f"  [{counter[0]}/{len(all_sources)}] datasources", flush=True)
 
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
         futs = [pool.submit(_process_source, a) for a in all_sources]
@@ -391,7 +312,7 @@ def fetch_gateway_data(s):
 
 
 # ===================================================================
-#  OPTION 2:  WORKSPACE DETAILS — parallelized
+#  OPTION 2:  WORKSPACE DETAILS
 # ===================================================================
 def fetch_workspace_data(s):
     print("  [Getting workspace list...]")
@@ -418,8 +339,8 @@ def fetch_workspace_data(s):
             ws_name = ws.get("name", "")
 
             users = _get_ws_users(s, wid)
-            rpt_count = _get_ws_item_count(s, wid, "reports")
-            ds_count = _get_ws_item_count(s, wid, "datasets")
+            reports = _get_items(s, wid, "reports")
+            datasets = _get_items(s, wid, "datasets")
 
             owners = [
                 u.get("displayName") or u.get("emailAddress", "")
@@ -433,8 +354,8 @@ def fetch_workspace_data(s):
                 "Type": ws.get("type", ""),
                 "State": ws.get("state", ""),
                 "Owner(s)": ", ".join(owners),
-                "# Reports": rpt_count,
-                "# Semantic Models": ds_count,
+                "# Reports": len(reports),
+                "# Semantic Models": len(datasets),
                 "# Users/Groups with Access": len(users),
                 "Capacity ID": ws.get("capacityId", ""),
             }
@@ -497,256 +418,169 @@ def _build_gateway_lookup(s):
 
 
 # ===================================================================
-#  Admin Scan API — batch workspace metadata in groups of 100
-# ===================================================================
-def _scan_workspaces(s, workspace_ids):
-    """Use admin scan API to get detailed workspace info with report dates and datasource details.
-    Returns (workspaces_list, datasource_instances_list) or ([], []) on failure."""
-    all_workspaces = []
-    all_ds_instances = []
-    total_batches = (len(workspace_ids) + 99) // 100
-
-    for batch_start in range(0, len(workspace_ids), 100):
-        batch = workspace_ids[batch_start:batch_start + 100]
-        batch_num = batch_start // 100 + 1
-        print(f"  [Scan batch {batch_num}/{total_batches} — {len(batch)} workspaces]", flush=True)
-
-        result = _post_json(
-            s,
-            f"{ADM}/workspaces/getInfo?datasourceDetails=true&datasetSchema=false"
-            "&datasetExpressions=false&lineage=false&users=false",
-            {"workspaces": batch},
-        )
-        if not result or "id" not in result:
-            print(f"  [Scan batch {batch_num} failed to start — skipping]")
-            continue
-        scan_id = result["id"]
-
-        status = ""
-        for _ in range(120):
-            time.sleep(2)
-            status_resp = _get_json(s, f"{ADM}/workspaces/scanStatus/{scan_id}")
-            if not status_resp:
-                continue
-            status = status_resp.get("status", "")
-            if status == "Succeeded":
-                break
-            if status not in ("NotStarted", "Running"):
-                print(f"  [Scan batch {batch_num} ended with status: {status}]")
-                break
-        else:
-            print(f"  [Scan batch {batch_num} timed out]")
-            continue
-
-        if status != "Succeeded":
-            continue
-
-        scan_result = _get_json(s, f"{ADM}/workspaces/scanResult/{scan_id}")
-        if scan_result:
-            all_workspaces.extend(scan_result.get("workspaces", []))
-            all_ds_instances.extend(scan_result.get("datasourceInstances", []))
-
-    return all_workspaces, all_ds_instances
-
-
-# ===================================================================
-#  OPTION 3:  WORKSPACE REPORTS & SEMANTIC MODELS
-#             Primary: admin scan API (batch, includes report dates)
-#             Fallback: per-workspace iteration with parallel threads
+#  OPTION 3:  WORKSPACE REPORTS & SEMANTIC MODELS (detailed)
+#
+#  Uses tenant-wide admin endpoints for reports & datasets which
+#  return modifiedDateTime (the per-workspace endpoint does not).
+#  Then fetches refresh dates and DSN mapping in parallel phases.
 # ===================================================================
 def fetch_workspace_items(s):
-    """Fetch all reports and semantic models per workspace with refresh dates and DSN mapping."""
+    """Fetch all reports and semantic models with dates and DSN mapping."""
+
+    # ---- Gateway lookup for DSN mapping ----
     print("  [Building gateway connection lookup...]")
     gw_lookup = _build_gateway_lookup(s)
     print(f"  [Indexed {len(gw_lookup)} gateway data sources]\n")
 
+    # ---- Workspace name map ----
     print("  [Getting workspace list...]")
     ws_list = get(s, ADM + "/groups?$top=5000")
     if ws_list is None:
         ws_list = get(s, API + "/groups") or []
-    if not ws_list:
-        print("  [No workspaces found]")
-        return []
+    ws_name_map = {ws.get("id", ""): ws.get("name", "") for ws in ws_list}
+    print(f"  [Found {len(ws_list)} workspaces]\n")
 
-    ws_ids = [ws["id"] for ws in ws_list if ws.get("id")]
-    total = len(ws_ids)
-    print(f"  [Found {total} workspaces — using admin scan API]\n")
+    # ==================================================================
+    #  PHASE 1 — Tenant-wide fetch of ALL reports and datasets
+    #  /admin/reports  and  /admin/datasets  return modifiedDateTime
+    # ==================================================================
+    print("  Phase 1/3 — fetching all reports & datasets (tenant-wide)...")
 
-    scanned_ws, ds_instances = _scan_workspaces(s, ws_ids)
+    all_reports = get(s, ADM + "/reports?$top=5000")
+    if all_reports is None:
+        all_reports = []
+    print(f"    Reports fetched: {len(all_reports)}")
 
-    if not scanned_ws:
-        print("  [Scan API unavailable — falling back to per-workspace fetching]\n")
-        return _fetch_workspace_items_fallback(s, ws_list, gw_lookup)
+    all_datasets = get(s, ADM + "/datasets?$top=5000")
+    if all_datasets is None:
+        all_datasets = []
+    print(f"    Datasets fetched: {len(all_datasets)}\n")
 
-    print(f"\n  [Scan complete — processing {len(scanned_ws)} workspaces]")
+    # ==================================================================
+    #  PHASE 2 — Refresh dates for refreshable datasets (parallel)
+    # ==================================================================
+    refreshable = [
+        (ds.get("workspaceId", ""), ds.get("id", ""))
+        for ds in all_datasets
+        if ds.get("isRefreshable")
+    ]
 
-    rows = []
-    refreshable = []
+    refresh_map = {}
+    lock = threading.Lock()
 
-    for ws in scanned_ws:
-        ws_name = ws.get("name", "")
-        wid = ws.get("id", "")
-
-        for rpt in ws.get("reports", []):
-            rows.append({
-                "Workspace Name": ws_name,
-                "Workspace ID": wid,
-                "Item Type": "Report",
-                "Name": rpt.get("name", ""),
-                "ID": rpt.get("id", ""),
-                "Created Date": rpt.get("createdDateTime", ""),
-                "Modified Date": rpt.get("modifiedDateTime", rpt.get("modifiedDate", "")),
-                "Last Refresh Date": "",
-                "DSN Connection Name": "",
-                "Gateway Cluster": "",
-            })
-
-        for ds in ws.get("datasets", []):
-            did = ds.get("id", "")
-
-            dsn_names = []
-            gw_clusters_list = []
-            for usage in ds.get("datasourceUsages", []):
-                dsi_id = usage.get("datasourceInstanceId", "")
-                if dsi_id and dsi_id in gw_lookup:
-                    dsn_names.append(gw_lookup[dsi_id]["Connection Name"])
-                    gw_clusters_list.append(gw_lookup[dsi_id]["Gateway Cluster"])
-
-            row_idx = len(rows)
-            rows.append({
-                "Workspace Name": ws_name,
-                "Workspace ID": wid,
-                "Item Type": "Semantic Model",
-                "Name": ds.get("name", ""),
-                "ID": did,
-                "Created Date": ds.get("createdDate", ""),
-                "Modified Date": "",
-                "Last Refresh Date": "",
-                "DSN Connection Name": ", ".join(dict.fromkeys(dsn_names)),
-                "Gateway Cluster": ", ".join(dict.fromkeys(gw_clusters_list)),
-            })
-
-            if ds.get("isRefreshable"):
-                refreshable.append((wid, did, row_idx))
-
-    # Fetch refresh dates in parallel
     if refreshable:
-        print(f"  [Fetching last refresh for {len(refreshable)} semantic models ({PARALLEL_WORKERS} threads)]")
-        lock = threading.Lock()
+        print(f"  Phase 2/3 — fetching refresh dates for {len(refreshable)} datasets ({PARALLEL_WORKERS} threads)")
         counter = [0]
+        ref_total = len(refreshable)
 
-        def _fetch_refresh(args):
-            wid, did, idx = args
+        def _fetch_refresh(pair):
+            wid, did = pair
+            last_refresh = ""
             try:
                 refreshes = get(s, f"{API}/groups/{wid}/datasets/{did}/refreshes?$top=1")
-                date = ""
                 if refreshes:
-                    date = refreshes[0].get("endTime", refreshes[0].get("startTime", ""))
-                with lock:
-                    rows[idx]["Last Refresh Date"] = date
-                    counter[0] += 1
-                    if counter[0] % 100 == 0:
-                        print(f"  [{counter[0]}/{len(refreshable)}] refreshes", flush=True)
+                    last_refresh = refreshes[0].get("endTime",
+                                                     refreshes[0].get("startTime", ""))
             except Exception:
-                with lock:
-                    counter[0] += 1
+                pass
+            with lock:
+                refresh_map[(wid, did)] = last_refresh
+                counter[0] += 1
+                c = counter[0]
+                if c % 100 == 0 or c == ref_total:
+                    print(f"    [{c}/{ref_total}] refresh dates", flush=True)
 
         with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
             list(pool.map(_fetch_refresh, refreshable))
-        print(f"  [{len(refreshable)}/{len(refreshable)}] refreshes done")
+        print()
+    else:
+        print("  Phase 2/3 — no refreshable datasets, skipping\n")
 
-    rpt_count = sum(1 for r in rows if r["Item Type"] == "Report")
-    model_count = sum(1 for r in rows if r["Item Type"] == "Semantic Model")
-    print(f"\n  Done — {rpt_count} reports, {model_count} semantic models\n")
-    return rows
+    # ==================================================================
+    #  PHASE 3 — DSN mapping for gateway-connected datasets (parallel)
+    # ==================================================================
+    gw_datasets = [
+        (ds.get("workspaceId", ""), ds.get("id", ""))
+        for ds in all_datasets
+        if ds.get("isOnPremGatewayRequired") and gw_lookup
+    ]
 
+    dsn_map = {}
 
-def _fetch_workspace_items_fallback(s, ws_list, gw_lookup):
-    """Fallback: per-workspace parallel iteration when scan API is unavailable."""
-    total = len(ws_list)
-    print(f"  [Processing {total} workspaces ({PARALLEL_WORKERS} threads)]\n")
+    if gw_datasets:
+        print(f"  Phase 3/3 — mapping DSN connections for {len(gw_datasets)} datasets ({PARALLEL_WORKERS} threads)")
+        counter = [0]
+        dsn_total = len(gw_datasets)
 
+        def _fetch_dsn(pair):
+            wid, did = pair
+            names, clusters = [], []
+            try:
+                ds_sources = get(s, f"{API}/groups/{wid}/datasets/{did}/datasources")
+                if ds_sources:
+                    for dss in ds_sources:
+                        gw_ds_id = dss.get("datasourceId", "")
+                        if gw_ds_id and gw_ds_id in gw_lookup:
+                            names.append(gw_lookup[gw_ds_id]["Connection Name"])
+                            clusters.append(gw_lookup[gw_ds_id]["Gateway Cluster"])
+            except Exception:
+                pass
+            with lock:
+                dsn_map[(wid, did)] = {
+                    "Connection Name": ", ".join(dict.fromkeys(names)),
+                    "Gateway Cluster": ", ".join(dict.fromkeys(clusters)),
+                }
+                counter[0] += 1
+                c = counter[0]
+                if c % 50 == 0 or c == dsn_total:
+                    print(f"    [{c}/{dsn_total}] DSN lookups", flush=True)
+
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+            list(pool.map(_fetch_dsn, gw_datasets))
+        print()
+    else:
+        print("  Phase 3/3 — no gateway datasets to map, skipping\n")
+
+    # ==================================================================
+    #  Assemble output rows
+    # ==================================================================
     rows = []
-    lock = threading.Lock()
-    counter = [0]
 
-    def _process_workspace(ws):
-        try:
-            wid = ws.get("id", "")
-            ws_name = ws.get("name", "")
-            local_rows = []
+    for rpt in all_reports:
+        wid = rpt.get("workspaceId", "")
+        rows.append({
+            "Workspace Name": ws_name_map.get(wid, wid),
+            "Workspace ID": wid,
+            "Item Type": "Report",
+            "Name": rpt.get("name", ""),
+            "ID": rpt.get("id", ""),
+            "Created Date": rpt.get("createdDateTime", ""),
+            "Modified Date": rpt.get("modifiedDateTime", ""),
+            "Last Refresh Date": "",
+            "DSN Connection Name": "",
+            "Gateway Cluster": "",
+        })
 
-            reports = get(s, ADM + f"/groups/{wid}/reports")
-            if reports is None:
-                reports = get(s, f"{API}/groups/{wid}/reports") or []
-
-            for rpt in reports:
-                local_rows.append({
-                    "Workspace Name": ws_name,
-                    "Workspace ID": wid,
-                    "Item Type": "Report",
-                    "Name": rpt.get("name", ""),
-                    "ID": rpt.get("id", ""),
-                    "Created Date": rpt.get("createdDateTime", ""),
-                    "Modified Date": rpt.get("modifiedDateTime", rpt.get("modifiedDate", "")),
-                    "Last Refresh Date": "",
-                    "DSN Connection Name": "",
-                    "Gateway Cluster": "",
-                })
-
-            datasets = get(s, ADM + f"/groups/{wid}/datasets")
-            if datasets is None:
-                datasets = get(s, f"{API}/groups/{wid}/datasets") or []
-
-            for ds in datasets:
-                did = ds.get("id", "")
-                last_refresh = ""
-                if ds.get("isRefreshable"):
-                    refreshes = get(s, f"{API}/groups/{wid}/datasets/{did}/refreshes?$top=1")
-                    if refreshes:
-                        last_refresh = refreshes[0].get("endTime",
-                                                         refreshes[0].get("startTime", ""))
-
-                dsn_names = []
-                gw_clusters_list = []
-                if gw_lookup:
-                    ds_sources = get(s, f"{API}/groups/{wid}/datasets/{did}/datasources")
-                    if ds_sources:
-                        for dss in ds_sources:
-                            gw_ds_id = dss.get("datasourceId", "")
-                            if gw_ds_id and gw_ds_id in gw_lookup:
-                                dsn_names.append(gw_lookup[gw_ds_id]["Connection Name"])
-                                gw_clusters_list.append(gw_lookup[gw_ds_id]["Gateway Cluster"])
-
-                local_rows.append({
-                    "Workspace Name": ws_name,
-                    "Workspace ID": wid,
-                    "Item Type": "Semantic Model",
-                    "Name": ds.get("name", ""),
-                    "ID": did,
-                    "Created Date": ds.get("createdDate", ""),
-                    "Modified Date": "",
-                    "Last Refresh Date": last_refresh,
-                    "DSN Connection Name": ", ".join(dict.fromkeys(dsn_names)),
-                    "Gateway Cluster": ", ".join(dict.fromkeys(gw_clusters_list)),
-                })
-
-            with lock:
-                rows.extend(local_rows)
-                counter[0] += 1
-                if counter[0] % 50 == 0 or counter[0] == total:
-                    print(f"  [{counter[0]}/{total}] workspaces", flush=True)
-        except Exception as e:
-            with lock:
-                counter[0] += 1
-            print(f"  [Error: {ws.get('name', '?')}: {e}]")
-
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
-        list(pool.map(_process_workspace, ws_list))
+    for ds in all_datasets:
+        wid = ds.get("workspaceId", "")
+        did = ds.get("id", "")
+        dsn_info = dsn_map.get((wid, did), {})
+        rows.append({
+            "Workspace Name": ws_name_map.get(wid, wid),
+            "Workspace ID": wid,
+            "Item Type": "Semantic Model",
+            "Name": ds.get("name", ""),
+            "ID": did,
+            "Created Date": ds.get("createdDate", ""),
+            "Modified Date": ds.get("modifiedDateTime", ds.get("configuredBy", "")),
+            "Last Refresh Date": refresh_map.get((wid, did), ""),
+            "DSN Connection Name": dsn_info.get("Connection Name", ""),
+            "Gateway Cluster": dsn_info.get("Gateway Cluster", ""),
+        })
 
     rpt_count = sum(1 for r in rows if r["Item Type"] == "Report")
     model_count = sum(1 for r in rows if r["Item Type"] == "Semantic Model")
-    print(f"\n  Done — {rpt_count} reports, {model_count} semantic models\n")
+    print(f"  Done — {rpt_count} reports, {model_count} semantic models\n")
     return rows
 
 
