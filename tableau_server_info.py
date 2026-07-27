@@ -394,6 +394,7 @@ _LINEAGE_GQL = """
     projectName
     updatedAt
     sheets { name path }
+    dashboards { name path }
     upstreamDatasources {
       luid
       name
@@ -470,13 +471,19 @@ def _fetch_lineage_metadata(server):
                 "refresh": refresh,
             })
 
+        # 'sheets' are worksheets only — dashboards are a separate field, and
+        # both show up as views in Tableau.
+        views = [{"name": s.get("name") or "", "url": s.get("path") or "",
+                  "type": "Worksheet"} for s in (wb.get("sheets") or [])]
+        views += [{"name": d.get("name") or "", "url": d.get("path") or "",
+                   "type": "Dashboard"} for d in (wb.get("dashboards") or [])]
+
         out.append({
             "id": wb.get("luid") or "",
             "name": wb.get("name") or "",
             "project": wb.get("projectName") or "",
             "modified": _fmt_dt(wb.get("updatedAt")),
-            "views": [{"name": s.get("name") or "", "url": s.get("path") or ""}
-                      for s in (wb.get("sheets") or [])],
+            "views": views,
             "datasources": ds_entries,
         })
 
@@ -577,7 +584,8 @@ def _fetch_lineage_rest(server):
             "name": wb.name,
             "project": wb.project_name or "",
             "modified": _fmt_dt(wb.updated_at),
-            "views": [{"name": v.name, "url": v.content_url or ""} for v in views],
+            "views": [{"name": v.name, "url": v.content_url or "", "type": ""}
+                      for v in views],
             "datasources": ds_entries,
         })
         time.sleep(0.1)
@@ -589,8 +597,10 @@ def _fetch_lineage_rest(server):
 def fetch_workbook_lineage(server):
     """
     Build two sheets:
-      Detail  - one row per workbook x view x data source
-      Summary - one row per workbook
+      Views    - ONE ROW PER VIEW; workbook name repeated on every row, the
+                 workbook's data sources joined into a single cell
+      Exploded - one row per view x data source (use when a workbook has
+                 several data sources and you want to filter on one)
 
     Note: Tableau does not expose which data source a *single* view uses, so
     every view inherits the full data source list of its parent workbook.
@@ -601,43 +611,50 @@ def fetch_workbook_lineage(server):
         data = _fetch_lineage_rest(server)
         source = "REST API"
 
-    detail, summary = [], []
+    view_rows, exploded = [], []
     for wb in data:
-        views = wb["views"] or [{"name": "(no views)", "url": ""}]
+        views = wb["views"] or [{"name": "(no views)", "url": "", "type": ""}]
         dss = wb["datasources"] or [{"name": "(none)", "kind": "", "project": "",
                                      "id": "", "refresh": ""}]
+
+        # Parallel lists so 'Data Source Name' and '... Last Refresh' line up
+        # cell-for-cell when a workbook has more than one source.
+        ds_names = "; ".join(d["name"] for d in dss)
+        ds_refreshes = "; ".join(d["refresh"] or "(none)" for d in dss)
+        latest = _latest([d["refresh"] for d in dss])
+
         for v in views:
+            view_rows.append({
+                "Workbook Name": wb["name"],
+                "View Name": v["name"],
+                "Data Source Name": ds_names,
+                "Data Source Last Refresh": ds_refreshes,
+                "Workbook Last Modified": wb["modified"],
+                "Latest Data Source Refresh": latest,
+                "View Type": v["type"],
+                "Workbook Project": wb["project"],
+                "Data Source Count": len(wb["datasources"]),
+                "View URL": v["url"],
+            })
             for ds in dss:
-                detail.append({
+                exploded.append({
                     "Workbook Name": wb["name"],
-                    "Workbook Project": wb["project"],
-                    "Workbook Last Modified": wb["modified"],
                     "View Name": v["name"],
-                    "View URL": v["url"],
                     "Data Source Name": ds["name"],
+                    "Data Source Last Refresh": ds["refresh"],
+                    "Workbook Last Modified": wb["modified"],
                     "Data Source Kind": ds["kind"],
                     "Data Source Project": ds["project"],
-                    "Data Source Last Refresh": ds["refresh"],
+                    "Workbook Project": wb["project"],
+                    "View Type": v["type"],
                     "Workbook ID": wb["id"],
                     "Data Source ID": ds["id"],
                 })
 
-        summary.append({
-            "Workbook Name": wb["name"],
-            "Workbook Project": wb["project"],
-            "Workbook Last Modified": wb["modified"],
-            "View Count": len(wb["views"]),
-            "View Names": ", ".join(v["name"] for v in wb["views"]),
-            "Data Source Count": len(wb["datasources"]),
-            "Data Sources": ", ".join(d["name"] for d in wb["datasources"]),
-            "Latest Data Source Refresh": _latest([d["refresh"] for d in wb["datasources"]]),
-            "Workbook ID": wb["id"],
-        })
-
-    print("  Done - " + str(len(summary)) + " workbooks, " +
-          str(len(detail)) + " detail rows  (via " + source + ")")
+    print("  Done - " + str(len(data)) + " workbooks, " + str(len(view_rows)) +
+          " views, " + str(len(exploded)) + " exploded rows  (via " + source + ")")
     print("")
-    return detail, summary
+    return view_rows, exploded
 
 
 # ===================================================================
@@ -789,12 +806,12 @@ def main():
                 input("  Press Enter to go back...")
 
             elif ch == "7":
-                detail, summary = fetch_workbook_lineage(server)
-                sheets = {"Workbook Summary": summary, "WB-View-DataSource": detail}
+                view_rows, exploded = fetch_workbook_lineage(server)
+                sheets = {"Views": view_rows, "Views x DataSource": exploded}
                 path = _save_multi(sheets, "Workbook_Lineage")
                 print("  Saved -> " + path)
-                print("    Workbook Summary:     " + str(len(summary)) + " rows")
-                print("    WB-View-DataSource:   " + str(len(detail)) + " rows")
+                print("    Views (1 row per view):  " + str(len(view_rows)) + " rows")
+                print("    Views x DataSource:      " + str(len(exploded)) + " rows")
                 input("  Press Enter to go back...")
 
             elif ch == "8":
@@ -818,7 +835,7 @@ def main():
                 print("  --- Flows ---")
                 flows = fetch_flows(server)
                 print("  --- Workbook Lineage ---")
-                lineage_detail, lineage_summary = fetch_workbook_lineage(server)
+                lineage_views, lineage_exploded = fetch_workbook_lineage(server)
 
                 sheets = {
                     "Projects": projects,
@@ -827,8 +844,8 @@ def main():
                     "Data Sources": datasources,
                     "Connections": connections,
                     "Flows": flows,
-                    "Workbook Summary": lineage_summary,
-                    "WB-View-DataSource": lineage_detail,
+                    "WB Views": lineage_views,
+                    "WB Views x DataSource": lineage_exploded,
                 }
                 path = _save_multi(sheets, "ALL")
                 total = sum(len(v) for v in sheets.values())
@@ -839,8 +856,8 @@ def main():
                 print("    Data Sources:  " + str(len(datasources)))
                 print("    Connections:   " + str(len(connections)))
                 print("    Flows:         " + str(len(flows)))
-                print("    WB Summary:    " + str(len(lineage_summary)))
-                print("    WB-View-DS:    " + str(len(lineage_detail)))
+                print("    WB Views:      " + str(len(lineage_views)))
+                print("    WB Views x DS: " + str(len(lineage_exploded)))
                 print("")
                 print("  NOTE: file may contain sensitive data (server names, usernames)")
                 input("  Press Enter to go back...")
