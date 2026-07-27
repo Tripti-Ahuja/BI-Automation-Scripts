@@ -1,6 +1,6 @@
 # BI Automation Scripts
 
-Python scripts to extract metadata from **Power BI** and **Tableau Server/Cloud** via REST APIs. Read-only, VDI-safe, no credentials saved to disk.
+Python scripts to extract metadata from **Power BI**, **Tableau Server/Cloud**, and **IBM Cognos Analytics** via REST APIs. Read-only, VDI-safe, no credentials saved to disk.
 
 ## Scripts
 
@@ -9,6 +9,7 @@ Python scripts to extract metadata from **Power BI** and **Tableau Server/Cloud*
 | `Powerbi.py` | Power BI | Gateway connections (DSN), workspace details, reports & semantic models with dates and DSN mapping |
 | `tableau_server_info.py` | Tableau | Projects, workbooks, views, data sources, connections, flows, site summary |
 | `connections.py` | Tableau | Deep connection extractor — includes connections embedded inside workbooks |
+| `cognos_extractor.py` | Cognos Analytics 12.x | Folders/packages, reports/dashboards, data sources, users/groups/roles |
 
 ## Quick Start
 
@@ -19,6 +20,7 @@ pip install truststore          # recommended for VDI/corporate environments
 python Powerbi.py               # Power BI — sign in via browser device-code
 python tableau_server_info.py   # Tableau — enter your Personal Access Token
 python connections.py           # Tableau — enter your Personal Access Token
+python cognos_extractor.py      # Cognos — enter namespace + AD credentials
 ```
 
 ## Output

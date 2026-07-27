@@ -2,7 +2,6 @@
 Power BI Admin Data Extractor
 Focus: Gateway Connections (DSN) & Workspace Details
 Prerequisites: pip install msal requests openpyxl
-     (VDI fix): pip install truststore
 """
 import sys, os, re, time, json, threading
 from datetime import datetime

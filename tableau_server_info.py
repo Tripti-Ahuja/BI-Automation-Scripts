@@ -357,7 +357,291 @@ def fetch_flows(server):
 
 
 # ===================================================================
-#  OPTION 7:  SERVER / SITE SUMMARY
+#  OPTION 7:  WORKBOOK -> VIEWS -> DATA SOURCES (+ refresh dates)
+# ===================================================================
+def _fmt_dt(value):
+    """Format a datetime (or ISO string) as 'YYYY-MM-DD HH:MM:SS'."""
+    if not value:
+        return ""
+    try:
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    except AttributeError:
+        s = str(value).replace("T", " ").replace("Z", "")
+        return s.split(".")[0].strip()
+
+
+def _best_refresh(*candidates):
+    """First non-empty refresh timestamp, formatted."""
+    for c in candidates:
+        f = _fmt_dt(c)
+        if f:
+            return f
+    return ""
+
+
+def _latest(values):
+    """Latest of a list of 'YYYY-MM-DD HH:MM:SS' strings (lexical sort works)."""
+    vals = [v for v in values if v]
+    return max(vals) if vals else ""
+
+
+# --- Path A: Metadata API (GraphQL) — gives real extract refresh times -------
+_LINEAGE_GQL = """
+{
+  workbooks {
+    luid
+    name
+    projectName
+    updatedAt
+    sheets { name path }
+    upstreamDatasources {
+      luid
+      name
+      projectName
+      extractLastRefreshTime
+      extractLastUpdateTime
+    }
+    embeddedDatasources {
+      name
+      extractLastRefreshTime
+      extractLastUpdateTime
+    }
+  }
+}
+"""
+
+
+def _fetch_lineage_metadata(server):
+    """
+    Pull workbook -> sheets -> data sources in one GraphQL call.
+    Returns a list of workbook dicts, or None if the Metadata API is
+    unavailable / not enabled / not permitted on this site.
+    """
+    if not hasattr(server, "metadata"):
+        print("  [Metadata API not supported by this tableauserverclient version]")
+        return None
+
+    print("  [Querying Metadata API (GraphQL) for lineage + refresh times...]")
+    try:
+        resp = server.metadata.query(_LINEAGE_GQL)
+    except Exception as e:
+        print("  [Metadata API unavailable: " + str(e) + "]")
+        return None
+
+    if not isinstance(resp, dict):
+        print("  [Metadata API returned an unexpected response]")
+        return None
+    if resp.get("errors"):
+        first = resp["errors"][0]
+        msg = first.get("message", str(first)) if isinstance(first, dict) else str(first)
+        print("  [Metadata API error: " + str(msg) + "]")
+        if not (resp.get("data") or {}).get("workbooks"):
+            return None
+
+    wbs = (resp.get("data") or {}).get("workbooks")
+    if not wbs:
+        print("  [Metadata API returned no workbooks]")
+        return None
+
+    out = []
+    for wb in wbs:
+        ds_entries = []
+        for ds in (wb.get("upstreamDatasources") or []):
+            ds_entries.append({
+                "name": ds.get("name") or "",
+                "kind": "Published",
+                "project": ds.get("projectName") or "",
+                "id": ds.get("luid") or "",
+                "refresh": _best_refresh(ds.get("extractLastRefreshTime"),
+                                         ds.get("extractLastUpdateTime")),
+            })
+        for ds in (wb.get("embeddedDatasources") or []):
+            refresh = _best_refresh(ds.get("extractLastRefreshTime"),
+                                    ds.get("extractLastUpdateTime"))
+            # Embedded wrappers around a published source duplicate the entry
+            # above with no refresh time of their own — skip those.
+            if not refresh and any(e["name"] == (ds.get("name") or "") for e in ds_entries):
+                continue
+            ds_entries.append({
+                "name": ds.get("name") or "",
+                "kind": "Embedded",
+                "project": "",
+                "id": "",
+                "refresh": refresh,
+            })
+
+        out.append({
+            "id": wb.get("luid") or "",
+            "name": wb.get("name") or "",
+            "project": wb.get("projectName") or "",
+            "modified": _fmt_dt(wb.get("updatedAt")),
+            "views": [{"name": s.get("name") or "", "url": s.get("path") or ""}
+                      for s in (wb.get("sheets") or [])],
+            "datasources": ds_entries,
+        })
+
+    print("  [Metadata API OK - " + str(len(out)) + " workbooks]")
+    return out
+
+
+# --- Path B: REST fallback ---------------------------------------------------
+def _task_refresh_map(server):
+    """
+    Fallback refresh times from extract-refresh tasks: {target_id: last_run_at}.
+    Requires site-admin rights; returns {} when not permitted.
+    """
+    mapping = {}
+    try:
+        tasks, _ = server.tasks.get()
+    except Exception as e:
+        print("  [Extract refresh tasks unavailable: " + str(e) + "]")
+        return mapping
+    for t in tasks:
+        target = getattr(t, "target", None)
+        last_run = _fmt_dt(getattr(t, "last_run_at", None))
+        if target is None or not last_run:
+            continue
+        tid = getattr(target, "id", None)
+        if tid and last_run > mapping.get(tid, ""):
+            mapping[tid] = last_run
+    return mapping
+
+
+def _populate(populate_fn, item, attr):
+    """Call a TSC populate_* method with retries, return the populated list."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            populate_fn(item)
+            return list(getattr(item, attr, None) or [])
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                print("    [!] " + attr + " failed for '" +
+                      str(getattr(item, "name", "?")) + "': " + str(e))
+    return []
+
+
+def _fetch_lineage_rest(server):
+    """
+    Same shape as _fetch_lineage_metadata, built from REST calls.
+    Slower (2 calls per workbook) and refresh dates depend on task visibility.
+    """
+    print("  [Falling back to REST API...]")
+    workbooks = _pager_to_list(server.workbooks, "workbooks")
+    datasources = _pager_to_list(server.datasources, "data sources")
+    ds_by_id = {ds.id: ds for ds in datasources}
+
+    refresh_map = _task_refresh_map(server)
+
+    total = len(workbooks)
+    print("  [Expanding " + str(total) + " workbooks (views + connections)...]")
+
+    out = []
+    for idx, wb in enumerate(workbooks, 1):
+        if idx % 25 == 0 or idx == total:
+            print("    [" + str(idx) + "/" + str(total) + "] " + wb.name[:40])
+
+        views = _populate(server.workbooks.populate_views, wb, "views")
+        conns = _populate(server.workbooks.populate_connections, wb, "connections")
+
+        ds_entries = []
+        seen = set()
+        for c in conns:
+            ds_id = getattr(c, "datasource_id", "") or ""
+            ds_name = getattr(c, "datasource_name", "") or ""
+            published = ds_by_id.get(ds_id)
+            if not ds_name:
+                # Embedded connection — no published data source behind it
+                ds_name = "(embedded) " + (getattr(c, "connection_type", "") or "connection")
+                addr = getattr(c, "server_address", "") or ""
+                if addr:
+                    ds_name += " @ " + addr
+            key = (ds_id, ds_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            ds_entries.append({
+                "name": published.name if published else ds_name,
+                "kind": "Published" if published else "Embedded",
+                "project": (published.project_name or "") if published else "",
+                "id": ds_id,
+                # No task visibility -> fall back to the data source's own
+                # Updated At, which changes on every extract refresh.
+                "refresh": refresh_map.get(ds_id, "") or
+                           (_fmt_dt(published.updated_at) if published else ""),
+            })
+
+        out.append({
+            "id": wb.id,
+            "name": wb.name,
+            "project": wb.project_name or "",
+            "modified": _fmt_dt(wb.updated_at),
+            "views": [{"name": v.name, "url": v.content_url or ""} for v in views],
+            "datasources": ds_entries,
+        })
+        time.sleep(0.1)
+
+    print("")
+    return out
+
+
+def fetch_workbook_lineage(server):
+    """
+    Build two sheets:
+      Detail  - one row per workbook x view x data source
+      Summary - one row per workbook
+
+    Note: Tableau does not expose which data source a *single* view uses, so
+    every view inherits the full data source list of its parent workbook.
+    """
+    data = _fetch_lineage_metadata(server)
+    source = "Metadata API"
+    if data is None:
+        data = _fetch_lineage_rest(server)
+        source = "REST API"
+
+    detail, summary = [], []
+    for wb in data:
+        views = wb["views"] or [{"name": "(no views)", "url": ""}]
+        dss = wb["datasources"] or [{"name": "(none)", "kind": "", "project": "",
+                                     "id": "", "refresh": ""}]
+        for v in views:
+            for ds in dss:
+                detail.append({
+                    "Workbook Name": wb["name"],
+                    "Workbook Project": wb["project"],
+                    "Workbook Last Modified": wb["modified"],
+                    "View Name": v["name"],
+                    "View URL": v["url"],
+                    "Data Source Name": ds["name"],
+                    "Data Source Kind": ds["kind"],
+                    "Data Source Project": ds["project"],
+                    "Data Source Last Refresh": ds["refresh"],
+                    "Workbook ID": wb["id"],
+                    "Data Source ID": ds["id"],
+                })
+
+        summary.append({
+            "Workbook Name": wb["name"],
+            "Workbook Project": wb["project"],
+            "Workbook Last Modified": wb["modified"],
+            "View Count": len(wb["views"]),
+            "View Names": ", ".join(v["name"] for v in wb["views"]),
+            "Data Source Count": len(wb["datasources"]),
+            "Data Sources": ", ".join(d["name"] for d in wb["datasources"]),
+            "Latest Data Source Refresh": _latest([d["refresh"] for d in wb["datasources"]]),
+            "Workbook ID": wb["id"],
+        })
+
+    print("  Done - " + str(len(summary)) + " workbooks, " +
+          str(len(detail)) + " detail rows  (via " + source + ")")
+    print("")
+    return detail, summary
+
+
+# ===================================================================
+#  OPTION 8:  SERVER / SITE SUMMARY
 # ===================================================================
 def fetch_summary(server):
     print("  [Counting server objects...]")
@@ -454,11 +738,12 @@ def main():
             print("  4. All Data Sources")
             print("  5. Data Source Connections (deep-dive)")
             print("  6. All Flows")
-            print("  7. Server / Site Summary (counts)")
-            print("  8. Export ALL (everything in one file)")
+            print("  7. Workbooks -> Views -> Data Sources (+ refresh dates)")
+            print("  8. Server / Site Summary (counts)")
+            print("  9. Export ALL (everything in one file)")
             print("  0. Exit")
 
-            ch = input("  Pick (0-8): ").strip()
+            ch = input("  Pick (0-9): ").strip()
 
             if ch == "0":
                 break
@@ -504,10 +789,19 @@ def main():
                 input("  Press Enter to go back...")
 
             elif ch == "7":
-                fetch_summary(server)
+                detail, summary = fetch_workbook_lineage(server)
+                sheets = {"Workbook Summary": summary, "WB-View-DataSource": detail}
+                path = _save_multi(sheets, "Workbook_Lineage")
+                print("  Saved -> " + path)
+                print("    Workbook Summary:     " + str(len(summary)) + " rows")
+                print("    WB-View-DataSource:   " + str(len(detail)) + " rows")
                 input("  Press Enter to go back...")
 
             elif ch == "8":
+                fetch_summary(server)
+                input("  Press Enter to go back...")
+
+            elif ch == "9":
                 print("")
                 print("  Fetching everything...")
                 print("")
@@ -523,6 +817,8 @@ def main():
                 connections = fetch_datasource_connections(server)
                 print("  --- Flows ---")
                 flows = fetch_flows(server)
+                print("  --- Workbook Lineage ---")
+                lineage_detail, lineage_summary = fetch_workbook_lineage(server)
 
                 sheets = {
                     "Projects": projects,
@@ -531,6 +827,8 @@ def main():
                     "Data Sources": datasources,
                     "Connections": connections,
                     "Flows": flows,
+                    "Workbook Summary": lineage_summary,
+                    "WB-View-DataSource": lineage_detail,
                 }
                 path = _save_multi(sheets, "ALL")
                 total = sum(len(v) for v in sheets.values())
@@ -541,6 +839,8 @@ def main():
                 print("    Data Sources:  " + str(len(datasources)))
                 print("    Connections:   " + str(len(connections)))
                 print("    Flows:         " + str(len(flows)))
+                print("    WB Summary:    " + str(len(lineage_summary)))
+                print("    WB-View-DS:    " + str(len(lineage_detail)))
                 print("")
                 print("  NOTE: file may contain sensitive data (server names, usernames)")
                 input("  Press Enter to go back...")
